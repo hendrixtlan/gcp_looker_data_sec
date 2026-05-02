@@ -1,33 +1,35 @@
 """
-Cloud Run service: recibe Pub/Sub push messages, parsea, escribe a BigQuery.
+Cloud Run service: passthrough de Pub/Sub a BigQuery.
 
-Pub/Sub push manda un POST con este body (la `data` viene en base64):
+DISEÑO:
+  - NO parsea el contenido del log (eso lo hace LookML después)
+  - Solo decodifica el mensaje base64 de Pub/Sub
+  - Lo guarda crudo en BigQuery con un timestamp de ingesta
+  - Esto da máxima flexibilidad: los analistas ajustan regex en LookML
+    sin necesitar redeploys
+
+Pub/Sub push manda un POST con esta estructura:
 {
   "message": {
     "data": "<base64 del log>",
     "messageId": "...",
     "publishTime": "...",
-    "attributes": {"source_host": "10.0.0.5"}  # opcional
+    "attributes": {...}
   },
   "subscription": "projects/X/subscriptions/Y"
 }
 
-Reglas de respuesta a Pub/Sub:
-  - 2xx → mensaje ACK (no se reintenta)
-  - 4xx/5xx → mensaje NACK (Pub/Sub reintenta con backoff)
-
-Por eso devolvemos 200 incluso si el log es "no parseable":
-ya lo guardamos como vendor='unknown' y reintentar no ayudaría.
-Solo devolvemos 5xx ante fallos transitorios (BQ caído, etc.).
+Reglas de respuesta:
+  - 2xx → Pub/Sub hace ACK (no reintenta)
+  - 5xx → Pub/Sub hace NACK (reintenta con backoff hasta el DLQ)
 """
 import base64
-import json
 import logging
 import os
+from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 
-from parsers import parse_log
-from bq_writer import insert_rows
+from bq_writer import insert_row
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -44,44 +46,36 @@ def health():
 def pubsub_push():
     envelope = request.get_json(silent=True)
     if not envelope or "message" not in envelope:
-        logger.warning("Mensaje Pub/Sub inválido: %s", envelope)
+        logger.warning("Mensaje Pub/Sub inválido")
         return jsonify({"error": "invalid envelope"}), 400
 
     message = envelope["message"]
     msg_id = message.get("messageId", "?")
-    attributes = message.get("attributes", {}) or {}
 
-    # Decodificar el log crudo (Pub/Sub manda data en base64)
+    # Decodificar el log crudo (Pub/Sub envía data en base64)
     try:
         raw_log = base64.b64decode(message.get("data", "")).decode("utf-8", errors="replace")
     except Exception as e:
-        logger.error("No pude decodificar mensaje %s: %s", msg_id, e)
-        # Datos corruptos: ACK para que no reintente eternamente
+        logger.error("Error decodificando msg=%s: %s", msg_id, e)
+        # Datos corruptos: ACK para no reintentar eternamente
         return "", 200
 
     if not raw_log.strip():
         return "", 200  # mensaje vacío, ACK silencioso
 
-    # Parsear
-    parsed = parse_log(raw_log)
-
-    # Enriquecer con metadata del Pub/Sub si vino
-    if "source_host" in attributes:
-        parsed.extra["source_host"] = attributes["source_host"]
-
-    # Escribir a BQ
+    # Insertar tal cual en BQ — sin parsear
     try:
-        insert_rows([parsed.to_bq_row()])
+        insert_row({
+            "ingest_timestamp": datetime.now(timezone.utc).isoformat(),
+            "raw_log": raw_log,
+        })
     except Exception as e:
         logger.error("Error escribiendo a BQ msg=%s: %s", msg_id, e)
-        # Error transitorio: 5xx → Pub/Sub reintenta
         return jsonify({"error": str(e)}), 503
 
-    logger.info("Procesado msg=%s vendor=%s src=%s",
-                msg_id, parsed.vendor, parsed.source_ip)
+    logger.info("Procesado msg=%s len=%d", msg_id, len(raw_log))
     return "", 200
 
 
 if __name__ == "__main__":
-    # Solo para debug local; en Cloud Run usa gunicorn (ver Dockerfile)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
